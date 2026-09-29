@@ -4,6 +4,7 @@ import uuid
 import logging
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
+from html import escape
 
 from dotenv import load_dotenv
 
@@ -28,38 +29,6 @@ from telegram.error import TelegramError
 
 
 # =========================================================
-# CONFIG
-# =========================================================
-
-load_dotenv()
-
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-CARD_NUMBER = os.getenv(
-    "CARD_NUMBER",
-    "شماره کارت در تنظیمات ربات وارد نشده است"
-)
-
-ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
-
-if not TELEGRAM_BOT_TOKEN:
-    raise RuntimeError(
-        "TELEGRAM_BOT_TOKEN در فایل .env تنظیم نشده است"
-    )
-
-if not ADMIN_ID_RAW:
-    raise RuntimeError(
-        "ADMIN_ID در فایل .env تنظیم نشده است"
-    )
-
-try:
-    ADMIN_ID = int(ADMIN_ID_RAW)
-except ValueError:
-    raise RuntimeError(
-        "ADMIN_ID باید عددی باشد"
-    )
-
-
-# =========================================================
 # LOGGING
 # =========================================================
 
@@ -70,13 +39,74 @@ logging.basicConfig(
 
 logger = logging.getLogger(__name__)
 
+# کمتر شدن لاگ‌های اضافی Telegram HTTP
+logging.getLogger("httpx").setLevel(logging.WARNING)
+
 
 # =========================================================
-# CONSTANTS
+# ENV
 # =========================================================
 
-SHIPPING_POST = "پست"
-SHIPPING_PICKUP = "دریافت توسط مشتری"
+load_dotenv()
+
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+
+CARD_NUMBER = os.getenv(
+    "CARD_NUMBER",
+    "شماره کارت در تنظیمات ربات وارد نشده است"
+).strip()
+
+ADMIN_ID_RAW = os.getenv("ADMIN_ID", "").strip()
+
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").strip().rstrip("/")
+
+WEBHOOK_PATH = os.getenv(
+    "WEBHOOK_PATH",
+    "telegram-webhook"
+).strip("/")
+
+WEBHOOK_SECRET = os.getenv(
+    "WEBHOOK_SECRET",
+    ""
+).strip()
+
+PORT_RAW = os.getenv("PORT", "10000").strip()
+
+
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError(
+        "TELEGRAM_BOT_TOKEN در Environment Variables تنظیم نشده است."
+    )
+
+if not ADMIN_ID_RAW:
+    raise RuntimeError(
+        "ADMIN_ID در Environment Variables تنظیم نشده است."
+    )
+
+try:
+    ADMIN_ID = int(ADMIN_ID_RAW)
+except ValueError:
+    raise RuntimeError(
+        "ADMIN_ID باید یک عدد باشد."
+    )
+
+try:
+    PORT = int(PORT_RAW)
+except ValueError:
+    raise RuntimeError(
+        "PORT باید عدد باشد."
+    )
+
+
+if not WEBHOOK_URL:
+    raise RuntimeError(
+        "WEBHOOK_URL در Environment Variables تنظیم نشده است."
+    )
+
+if not WEBHOOK_PATH:
+    raise RuntimeError(
+        "WEBHOOK_PATH نمی‌تواند خالی باشد."
+    )
 
 
 # =========================================================
@@ -85,6 +115,7 @@ SHIPPING_PICKUP = "دریافت توسط مشتری"
 
 START = "start"
 NAME = "name"
+LAST_NAME = "last_name"
 PHONE = "phone"
 PRODUCT = "product"
 PRODUCT_DETAILS = "product_details"
@@ -97,6 +128,14 @@ WAITING_ADMIN_PRICE = "waiting_admin_price"
 PAYMENT = "payment"
 RECEIPT = "receipt"
 CONFIRM = "confirm"
+
+
+# =========================================================
+# CONSTANTS
+# =========================================================
+
+SHIPPING_POST = "پست"
+SHIPPING_PICKUP = "دریافت توسط مشتری"
 
 
 # =========================================================
@@ -126,7 +165,6 @@ class OrderData:
     cart: List[CartItem] = field(default_factory=list)
 
     full_address: str = ""
-
     shipping_method: str = ""
 
     customer_description: str = ""
@@ -138,130 +176,98 @@ class OrderData:
     receipt_type: str = ""
 
     waiting_for_admin_price: bool = False
-
-    # Telegram message ID of the admin price-request message
     admin_price_message_id: Optional[int] = None
 
 
 # =========================================================
-# STORAGE
+# MEMORY STORAGE
 # =========================================================
 
 orders: Dict[int, OrderData] = {}
 
-# admin_message_id -> {
-#     "user_id": int,
-#     "order_id": str
-# }
 admin_price_requests: Dict[int, Dict] = {}
 
 
 # =========================================================
-# TEXT HELPERS
+# GLOBAL APPLICATION
 # =========================================================
 
-def normalize_text(text: Optional[str]) -> str:
-    if not text:
-        return ""
-
-    text = text.strip()
-
-    replacements = {
-        "ي": "ی",
-        "ى": "ی",
-        "ك": "ک",
-        "ۀ": "ه",
-        "ة": "ه",
-        "\u200c": " ",
-        "\u200f": "",
-        "\u200e": "",
-    }
-
-    for old, new in replacements.items():
-        text = text.replace(old, new)
-
-    return text
+application: Optional[Application] = None
 
 
-def normalize_digits(text: Optional[str]) -> str:
-    if not text:
-        return ""
+# =========================================================
+# GENERAL HELPERS
+# =========================================================
 
-    replacements = str.maketrans(
+def normalize_text(value: str) -> str:
+    return " ".join((value or "").strip().split())
+
+
+def normalize_digits(value: str) -> str:
+    value = str(value or "")
+
+    translation = str.maketrans(
         "۰۱۲۳۴۵۶۷۸۹٠١٢٣٤٥٦٧٨٩",
-        "01234567890123456789",
+        "01234567890123456789"
     )
 
-    return text.translate(replacements)
+    return value.translate(translation)
 
 
-def normalize_price(text: Optional[str]) -> Optional[str]:
-    if not text:
+def normalize_price(value: str) -> Optional[str]:
+    value = normalize_digits(value)
+
+    # حذف جداکننده‌ها
+    cleaned = re.sub(r"[,\s٬،]", "", value)
+
+    # فقط عدد
+    if not cleaned.isdigit():
         return None
 
-    text = normalize_digits(text)
-    text = text.replace(",", "")
-    text = text.replace("٬", "")
-    text = text.replace("تومان", "")
-    text = text.replace("تومن", "")
-    text = text.replace("ریال", "")
-    text = text.replace(" ", "")
-    text = text.strip()
+    number = int(cleaned)
 
-    if not text.isdigit():
+    if number <= 0:
         return None
 
-    return text
+    return f"{number:,}"
 
 
-def get_message_text(message) -> str:
-    if not message:
+def get_message_text(update: Update) -> str:
+    if not update.message:
         return ""
 
-    return normalize_text(
-        getattr(message, "text", None)
-        or getattr(message, "caption", None)
-        or ""
-    )
+    return normalize_text(update.message.text or "")
 
 
-def get_message_id(message) -> Optional[int]:
-    if not message:
+def get_message_id(update: Update) -> Optional[int]:
+    if not update.message:
         return None
 
-    return getattr(message, "message_id", None)
+    return update.message.message_id
 
 
 def get_user_id(update: Update) -> Optional[int]:
-    if update.effective_user:
-        return update.effective_user.id
-
-    return None
-
-
-# =========================================================
-# REPLY MESSAGE HELPERS
-# =========================================================
-
-def get_replied_message(message):
-    if not message:
+    if not update.effective_user:
         return None
 
-    return getattr(message, "reply_to_message", None)
+    return update.effective_user.id
 
 
-def get_replied_message_id(message) -> Optional[int]:
-    replied = get_replied_message(message)
+def get_replied_message(update: Update):
+    if not update.message:
+        return None
+
+    return update.message.reply_to_message
+
+
+def get_replied_message_id(update: Update) -> Optional[int]:
+    replied = get_replied_message(update)
 
     if not replied:
         return None
 
-    return getattr(replied, "message_id", None)
+    return replied.message_id
 
-
-# =========================================================
-# ORDER HELPERS
-# =========================================================
 
 def get_order(user_id: int) -> OrderData:
     if user_id not in orders:
@@ -270,23 +276,30 @@ def get_order(user_id: int) -> OrderData:
     return orders[user_id]
 
 
-def cleanup_price_request(order: OrderData):
-    if order.admin_price_message_id is not None:
-        admin_price_requests.pop(
-            order.admin_price_message_id,
-            None
-        )
-
-    order.admin_price_message_id = None
-
-
-def reset_order(user_id: int):
-    old_order = orders.get(user_id)
-
-    if old_order:
-        cleanup_price_request(old_order)
+def reset_order(user_id: int) -> OrderData:
+    cleanup_price_requests_for_user(user_id)
 
     orders[user_id] = OrderData()
+
+    return orders[user_id]
+
+
+def cleanup_price_request(message_id: Optional[int]):
+    if message_id is None:
+        return
+
+    admin_price_requests.pop(message_id, None)
+
+
+def cleanup_price_requests_for_user(user_id: int):
+    to_delete = []
+
+    for message_id, data in admin_price_requests.items():
+        if data.get("user_id") == user_id:
+            to_delete.append(message_id)
+
+    for message_id in to_delete:
+        admin_price_requests.pop(message_id, None)
 
 
 def find_order_by_order_id(order_id: str):
@@ -305,10 +318,6 @@ def extract_order_id(text: str) -> Optional[str]:
 
     text = normalize_text(text).upper()
 
-    # مثال:
-    # شماره سفارش: S-ABC12345
-    # شماره سفارش *: S-ABC12345
-
     patterns = [
         r"شماره\s*سفارش\s*[:：]?\s*([A-Z0-9-]+)",
         r"ORDER\s*ID\s*[:：]?\s*([A-Z0-9-]+)",
@@ -316,47 +325,49 @@ def extract_order_id(text: str) -> Optional[str]:
     ]
 
     for pattern in patterns:
-        match = re.search(pattern, text)
+        match = re.search(pattern, text, re.IGNORECASE)
 
         if match:
-            return match.group(1)
+            return match.group(1).upper()
 
     return None
 
 
-# =========================================================
-# MEDIA HELPERS
-# =========================================================
-
-def get_photo_file_id(message) -> Optional[str]:
-    if not message:
+def get_photo_file_id(update: Update) -> Optional[str]:
+    if not update.message:
         return None
 
-    photos = getattr(message, "photo", None)
-
-    if not photos:
+    if not update.message.photo:
         return None
 
-    try:
-        # آخرین PhotoSize معمولاً باکیفیت‌ترین است
-        photo = photos[-1]
+    return update.message.photo[-1].file_id
 
-        return getattr(photo, "file_id", None)
 
-    except Exception:
+def get_document_file_id(update: Update) -> Optional[str]:
+    if not update.message:
         return None
 
-
-def get_document_file_id(message) -> Optional[str]:
-    if not message:
+    if not update.message.document:
         return None
 
-    document = getattr(message, "document", None)
+    return update.message.document.file_id
 
-    if not document:
-        return None
 
-    return getattr(document, "file_id", None)
+async def context_bot_send_message(
+    chat_id: int,
+    text: str,
+    **kwargs
+):
+    if application is None:
+        raise RuntimeError(
+            "Application هنوز ساخته نشده است."
+        )
+
+    return await application.bot.send_message(
+        chat_id=chat_id,
+        text=text,
+        **kwargs
+    )
 
 
 # =========================================================
@@ -364,307 +375,359 @@ def get_document_file_id(message) -> Optional[str]:
 # =========================================================
 
 def main_keyboard():
-    return InlineKeyboardMarkup([
+    return ReplyKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "🛍 شروع خرید",
-                callback_data="start_shopping"
-            )
-        ]
-    ])
+            [
+                KeyboardButton("🛍 شروع خرید")
+            ]
+        ],
+        resize_keyboard=True,
+        one_time_keyboard=False,
+    )
 
 
 def cancel_keyboard():
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "❌ لغو سفارش",
-                callback_data="cancel_order"
-            )
+            [
+                InlineKeyboardButton(
+                    "❌ لغو سفارش",
+                    callback_data="cancel_order"
+                )
+            ]
         ]
-    ])
+    )
 
 
 def product_keyboard():
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "❌ لغو سفارش",
-                callback_data="cancel_order"
-            )
+            [
+                InlineKeyboardButton(
+                    "❌ لغو سفارش",
+                    callback_data="cancel_order"
+                )
+            ]
         ]
-    ])
-
-
-def cart_keyboard():
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "➕ افزودن محصول دیگر",
-                callback_data="add_product"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "➡️ ادامه سفارش",
-                callback_data="continue_order"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "❌ لغو سفارش",
-                callback_data="cancel_order"
-            )
-        ],
-    ])
+    )
 
 
 def product_details_keyboard():
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "⏭ بدون توضیحات",
-                callback_data="skip_product_details"
-            )
-        ],
+            [
+                InlineKeyboardButton(
+                    "⏭ بدون توضیحات",
+                    callback_data="skip_product_details"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ لغو سفارش",
+                    callback_data="cancel_order"
+                )
+            ]
+        ]
+    )
+
+
+def cart_keyboard():
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "❌ لغو سفارش",
-                callback_data="cancel_order"
-            )
-        ],
-    ])
+            [
+                InlineKeyboardButton(
+                    "➕ افزودن محصول دیگر",
+                    callback_data="add_product"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "➡️ ادامه سفارش",
+                    callback_data="continue_order"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ لغو سفارش",
+                    callback_data="cancel_order"
+                )
+            ]
+        ]
+    )
 
 
 def shipping_keyboard():
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "📦 پست",
-                callback_data="shipping_post"
-            ),
-            InlineKeyboardButton(
-                "🏪 دریافت توسط مشتری",
-                callback_data="shipping_pickup"
-            ),
-        ],
-        [
-            InlineKeyboardButton(
-                "❌ لغو سفارش",
-                callback_data="cancel_order"
-            )
-        ],
-    ])
+            [
+                InlineKeyboardButton(
+                    "📦 ارسال با پست",
+                    callback_data="shipping_post"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "🏪 دریافت توسط مشتری",
+                    callback_data="shipping_pickup"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ لغو سفارش",
+                    callback_data="cancel_order"
+                )
+            ]
+        ]
+    )
 
 
 def price_keyboard():
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "💰 قیمت را می‌دانم",
-                callback_data="price_known"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "❓ قیمت را نمی‌دانم",
-                callback_data="price_unknown"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "❌ لغو سفارش",
-                callback_data="cancel_order"
-            )
-        ],
-    ])
+            [
+                InlineKeyboardButton(
+                    "💰 قیمت را می‌دانم",
+                    callback_data="price_known"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❓ قیمت را نمی‌دانم",
+                    callback_data="price_unknown"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ لغو سفارش",
+                    callback_data="cancel_order"
+                )
+            ]
+        ]
+    )
 
 
 def receipt_keyboard():
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "📸 ارسال رسید پرداخت",
-                callback_data="send_receipt"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "❌ لغو سفارش",
-                callback_data="cancel_order"
-            )
-        ],
-    ])
+            [
+                InlineKeyboardButton(
+                    "📤 ارسال رسید پرداخت",
+                    callback_data="send_receipt"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ لغو سفارش",
+                    callback_data="cancel_order"
+                )
+            ]
+        ]
+    )
 
 
 def confirm_keyboard():
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton(
-                "✅ تأیید نهایی سفارش",
-                callback_data="confirm_order"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "✏️ ویرایش اطلاعات",
-                callback_data="edit_order"
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "❌ لغو سفارش",
-                callback_data="cancel_order"
-            )
-        ],
-    ])
+            [
+                InlineKeyboardButton(
+                    "✅ تأیید نهایی سفارش",
+                    callback_data="confirm_order"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "✏️ ویرایش اطلاعات",
+                    callback_data="edit_order"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    "❌ لغو سفارش",
+                    callback_data="cancel_order"
+                )
+            ]
+        ]
+    )
 
 
 # =========================================================
-# ORDER TEXT
+# CART TEXT
 # =========================================================
 
 def build_cart_text(order: OrderData) -> str:
     if not order.cart:
-        return "سبد خرید خالی است."
+        return "🛒 <b>سبد خرید خالی است.</b>"
 
-    lines = ["🛒 محصولات سفارش:"]
+    lines = [
+        "🛒 <b>محصولات سفارش:</b>"
+    ]
 
     for index, item in enumerate(order.cart, start=1):
 
         if item.product_type == "photo":
-            product_name = "📷 محصول ارسال‌شده به صورت عکس"
+            product_title = "📷 محصول ارسال‌شده به‌صورت عکس"
 
         elif item.product_type == "document":
-            product_name = "📄 محصول ارسال‌شده به صورت فایل"
+            product_title = "📄 محصول ارسال‌شده به‌صورت فایل"
 
         else:
-            product_name = item.product_text or "محصول بدون نام"
+            product_title = (
+                escape(item.product_text)
+                if item.product_text
+                else "محصول متنی"
+            )
 
         lines.append(
-            f"\n{index}. {product_name}"
+            f"\n<b>محصول {index}</b>\n"
+            f"{product_title}"
         )
 
         if item.details:
             lines.append(
-                f"   📝 جزئیات: {item.details}"
+                f"\n📝 <b>توضیحات:</b> "
+                f"{escape(item.details)}"
             )
 
     return "\n".join(lines)
 
 
-def build_customer_order_summary(order: OrderData) -> str:
-    price_text = (
-        f"{order.price} تومان"
-        if order.price
-        else "نامشخص"
-    )
+# =========================================================
+# CUSTOMER SUMMARY
+# =========================================================
 
-    receipt_text = (
-        "✅ رسید پرداخت دریافت شده"
-        if order.receipt_file_id
-        else "❌ رسید دریافت نشده"
+def build_customer_order_summary(order: OrderData) -> str:
+
+    price_text = (
+        f"{escape(order.price)} تومان"
+        if order.price
+        else "در انتظار تعیین قیمت"
     )
 
     return (
-        "🧾 <b>اطلاعات کامل سفارش</b>\n"
-        "\n"
-        f"🔖 <b>شماره سفارش:</b> <code>{order.order_id}</code>\n"
-        "\n"
+        "📋 <b>خلاصه سفارش شما</b>\n\n"
+
+        f"🔖 <b>شماره سفارش:</b> "
+        f"<code>{escape(order.order_id)}</code>\n\n"
+
         f"👤 <b>نام:</b> "
-        f"{order.first_name} {order.last_name}\n"
-        f"📱 <b>شماره موبایل:</b> {order.phone}\n"
-        "\n"
-        f"{build_cart_text(order)}\n"
-        "\n"
-        f"📍 <b>آدرس:</b>\n{order.full_address}\n"
-        "\n"
-        f"🚚 <b>روش ارسال:</b> {order.shipping_method}\n"
-        "\n"
-        f"📝 <b>توضیحات سفارش:</b>\n"
-        f"{order.customer_description or 'ندارد'}\n"
-        "\n"
-        f"💰 <b>مبلغ:</b> {price_text}\n"
-        "\n"
-        f"💳 <b>وضعیت رسید:</b> {receipt_text}\n"
-        "\n"
-        "⚠️ لطفاً اطلاعات بالا را با دقت بررسی کنید.\n"
-        "در صورت صحیح بودن اطلاعات، روی «تأیید نهایی سفارش» بزنید."
+        f"{escape(order.first_name)} "
+        f"{escape(order.last_name)}\n"
+
+        f"📱 <b>شماره تماس:</b> "
+        f"{escape(order.phone)}\n\n"
+
+        f"{build_cart_text(order)}\n\n"
+
+        f"📍 <b>آدرس:</b>\n"
+        f"{escape(order.full_address)}\n\n"
+
+        f"🚚 <b>روش دریافت:</b> "
+        f"{escape(order.shipping_method)}\n\n"
+
+        f"📝 <b>توضیحات مشتری:</b>\n"
+        f"{escape(order.customer_description or 'ندارد')}\n\n"
+
+        f"💰 <b>مبلغ:</b> "
+        f"{price_text}\n\n"
+
+        "لطفاً اطلاعات بالا را بررسی کنید و یکی از گزینه‌های زیر را انتخاب کنید."
     )
 
 
+# =========================================================
+# ADMIN SUMMARY
+# =========================================================
+
 def build_admin_order_summary(
-    order: OrderData,
-    customer_id: int
+    user_id: int,
+    order: OrderData
 ) -> str:
 
     price_text = (
-        f"{order.price} تومان"
+        f"{escape(order.price)} تومان"
         if order.price
-        else "نامشخص"
+        else "تعیین نشده"
     )
 
     return (
-        "🛍 <b>سفارش جدید</b>\n"
-        "\n"
+        "🛍 <b>سفارش جدید سورین</b>\n\n"
+
         f"🔖 <b>شماره سفارش:</b> "
-        f"<code>{order.order_id}</code>\n"
-        f"👤 <b>Telegram ID:</b> "
-        f"<code>{customer_id}</code>\n"
-        "\n"
-        f"👤 <b>نام:</b> "
-        f"{order.first_name} {order.last_name}\n"
-        f"📱 <b>شماره:</b> {order.phone}\n"
-        "\n"
-        f"{build_cart_text(order)}\n"
-        "\n"
-        f"📍 <b>آدرس:</b>\n{order.full_address}\n"
-        "\n"
-        f"🚚 <b>روش ارسال:</b> {order.shipping_method}\n"
-        "\n"
+        f"<code>{escape(order.order_id)}</code>\n"
+
+        f"🆔 <b>Telegram ID:</b> "
+        f"<code>{user_id}</code>\n\n"
+
+        f"👤 <b>نام مشتری:</b> "
+        f"{escape(order.first_name)} "
+        f"{escape(order.last_name)}\n"
+
+        f"📱 <b>شماره تماس:</b> "
+        f"{escape(order.phone)}\n\n"
+
+        f"{build_cart_text(order)}\n\n"
+
+        f"📍 <b>آدرس:</b>\n"
+        f"{escape(order.full_address)}\n\n"
+
+        f"🚚 <b>روش دریافت:</b> "
+        f"{escape(order.shipping_method)}\n\n"
+
         f"📝 <b>توضیحات مشتری:</b>\n"
-        f"{order.customer_description or 'ندارد'}\n"
-        "\n"
-        f"💰 <b>مبلغ:</b> {price_text}\n"
-        "\n"
-        "💳 <b>رسید پرداخت:</b> ارسال شده"
+        f"{escape(order.customer_description or 'ندارد')}\n\n"
+
+        f"💰 <b>مبلغ:</b> "
+        f"{price_text}\n"
     )
 
 
 # =========================================================
-# CUSTOMER MESSAGES
+# PROMPTS
 # =========================================================
 
 async def send_welcome(update: Update):
-    await update.message.reply_text(
-        "سلام 👋\n"
-        "به ربات فروشگاه سورین خوش آمدید.\n\n"
-        "برای شروع خرید روی دکمه زیر بزنید.",
-        reply_markup=main_keyboard(),
+
+    text = (
+        "سلام 👋\n\n"
+        "به فروشگاه سورین خوش آمدید. 🛍\n\n"
+        "برای شروع خرید روی دکمه زیر بزنید."
     )
+
+    if update.message:
+        await update.message.reply_text(
+            text,
+            reply_markup=main_keyboard()
+        )
 
 
 async def ask_first_name(update: Update):
-    await update.message.reply_text(
-        "👤 لطفاً نام خود را وارد کنید:",
-        reply_markup=cancel_keyboard(),
-    )
+
+    if update.message:
+        await update.message.reply_text(
+            "👤 لطفاً <b>نام</b> خود را وارد کنید.",
+            parse_mode="HTML",
+            reply_markup=cancel_keyboard()
+        )
 
 
 async def ask_last_name(update: Update):
-    await update.message.reply_text(
-        "👤 لطفاً نام خانوادگی خود را وارد کنید:",
-        reply_markup=cancel_keyboard(),
-    )
+
+    if update.message:
+        await update.message.reply_text(
+            "👤 حالا <b>نام خانوادگی</b> خود را وارد کنید.",
+            parse_mode="HTML",
+            reply_markup=cancel_keyboard()
+        )
 
 
 async def ask_phone(update: Update):
+
     keyboard = ReplyKeyboardMarkup(
         [
             [
                 KeyboardButton(
-                    "📱 ارسال شماره موبایل",
-                    request_contact=True,
+                    "📱 ارسال شماره تماس",
+                    request_contact=True
                 )
             ]
         ],
@@ -672,107 +735,109 @@ async def ask_phone(update: Update):
         one_time_keyboard=True,
     )
 
-    await update.message.reply_text(
-        "📱 لطفاً شماره موبایل خود را ارسال کنید.\n"
-        "می‌توانید از دکمه زیر برای ارسال خودکار شماره استفاده کنید.",
-        reply_markup=keyboard,
-    )
+    if update.message:
+        await update.message.reply_text(
+            "📱 لطفاً شماره تماس خود را ارسال کنید.\n\n"
+            "می‌توانید از دکمه زیر برای ارسال مستقیم شماره استفاده کنید.",
+            reply_markup=keyboard
+        )
 
 
 async def ask_product(update: Update):
-    await update.message.reply_text(
-        "🛍 لطفاً محصول موردنظر را ارسال کنید.\n\n"
-        "می‌توانید یکی از موارد زیر را بفرستید:\n"
-        "• عکس محصول\n"
-        "• فایل محصول\n"
-        "• کد یا نام محصول",
-        reply_markup=product_keyboard(),
-    )
+
+    if update.message:
+        await update.message.reply_text(
+            "🛍 لطفاً محصول موردنظر را ارسال کنید.\n\n"
+            "می‌توانید یکی از این موارد را بفرستید:\n"
+            "📷 عکس محصول\n"
+            "📄 فایل محصول\n"
+            "📝 کد یا نام محصول",
+            reply_markup=product_keyboard()
+        )
 
 
 async def ask_product_details(update: Update):
-    await update.message.reply_text(
-        "📝 اگر توضیحی درباره این محصول دارید، همینجا ارسال کنید.\n\n"
-        "مثلاً:\n"
-        "• سایز L\n"
-        "• رنگ مشکی\n"
-        "• تعداد ۲ عدد\n\n"
-        "اگر توضیحی ندارید، روی دکمه زیر بزنید.",
-        reply_markup=product_details_keyboard(),
-    )
+
+    if update.message:
+        await update.message.reply_text(
+            "📝 اگر برای این محصول توضیحی دارید، "
+            "مثلاً رنگ، سایز یا تعداد، آن را بنویسید.\n\n"
+            "اگر توضیحی ندارید، روی «بدون توضیحات» بزنید.",
+            reply_markup=product_details_keyboard()
+        )
 
 
 async def ask_address(update: Update):
-    await update.message.reply_text(
-        "📍 لطفاً آدرس کامل خود را در یک پیام ارسال کنید.\n\n"
-        "مثال:\n"
-        "استان، شهر، خیابان، کوچه، پلاک، واحد، کد پستی",
-        reply_markup=cancel_keyboard(),
-    )
+
+    if update.message:
+        await update.message.reply_text(
+            "📍 لطفاً <b>آدرس کامل</b> خود را وارد کنید.",
+            parse_mode="HTML",
+            reply_markup=cancel_keyboard()
+        )
 
 
 async def ask_shipping(update: Update):
-    await update.message.reply_text(
-        "🚚 لطفاً روش دریافت سفارش را انتخاب کنید:",
-        reply_markup=shipping_keyboard(),
-    )
+
+    if update.message:
+        await update.message.reply_text(
+            "🚚 روش دریافت سفارش را انتخاب کنید:",
+            reply_markup=shipping_keyboard()
+        )
 
 
 async def ask_customer_description(update: Update):
-    await update.message.reply_text(
-        "📝 اگر توضیح دیگری درباره سفارش دارید ارسال کنید.\n\n"
-        "اگر توضیحی ندارید، روی «بدون توضیحات» بزنید.",
-        reply_markup=InlineKeyboardMarkup([
-            [
-                InlineKeyboardButton(
-                    "⏭ بدون توضیحات",
-                    callback_data="skip_customer_description",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "❌ لغو سفارش",
-                    callback_data="cancel_order",
-                )
-            ],
-        ]),
-    )
+
+    if update.message:
+        await update.message.reply_text(
+            "📝 اگر توضیح دیگری درباره سفارش دارید، "
+            "اینجا بنویسید.\n\n"
+            "اگر توضیحی ندارید، عبارت «ندارم» را ارسال کنید."
+        )
 
 
 async def ask_price_status(update: Update):
-    await update.message.reply_text(
-        "💰 وضعیت قیمت محصول را مشخص کنید:",
-        reply_markup=price_keyboard(),
-    )
+
+    if update.message:
+        await update.message.reply_text(
+            "💰 آیا قیمت محصول را می‌دانید؟",
+            reply_markup=price_keyboard()
+        )
 
 
 async def ask_price(update: Update):
-    await update.message.reply_text(
-        "💰 لطفاً مبلغ سفارش را فقط به صورت عدد وارد کنید.\n\n"
-        "مثال:\n"
-        "850000",
-        reply_markup=cancel_keyboard(),
-    )
+
+    if update.message:
+        await update.message.reply_text(
+            "💰 لطفاً مبلغ نهایی سفارش را به تومان وارد کنید.\n\n"
+            "مثال:\n"
+            "<code>850000</code>",
+            parse_mode="HTML",
+            reply_markup=cancel_keyboard()
+        )
 
 
 async def ask_receipt(update: Update):
-    await update.message.reply_text(
-        "💳 لطفاً مبلغ را به کارت زیر واریز کنید:\n\n"
-        f"<code>{CARD_NUMBER}</code>\n\n"
-        "سپس عکس یا فایل رسید پرداخت را ارسال کنید.",
-        reply_markup=receipt_keyboard(),
-        parse_mode="HTML",
-    )
+
+    if update.message:
+        await update.message.reply_text(
+            "💳 مبلغ سفارش را به کارت زیر واریز کنید:\n\n"
+            f"<code>{escape(CARD_NUMBER)}</code>\n\n"
+            "سپس رسید پرداخت را به‌صورت عکس یا فایل ارسال کنید.",
+            parse_mode="HTML",
+            reply_markup=receipt_keyboard()
+        )
 
 
 # =========================================================
-# START COMMAND
+# START
 # =========================================================
 
 async def start_command(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     user_id = get_user_id(update)
 
     if user_id is None:
@@ -784,13 +849,326 @@ async def start_command(
 
 
 # =========================================================
-# CUSTOMER CALLBACKS
+# SEND PRICE REQUEST TO ADMIN
+# =========================================================
+
+async def send_price_request_to_admin(
+    user_id: int,
+    order: OrderData
+):
+
+    text = (
+        "💰 <b>درخواست قیمت جدید</b>\n\n"
+
+        f"🔖 <b>شماره سفارش:</b> "
+        f"<code>{escape(order.order_id)}</code>\n"
+
+        f"👤 <b>مشتری:</b> "
+        f"{escape(order.first_name)} "
+        f"{escape(order.last_name)}\n"
+
+        f"📱 <b>شماره:</b> "
+        f"{escape(order.phone)}\n"
+
+        f"🆔 <b>Telegram ID:</b> "
+        f"<code>{user_id}</code>\n\n"
+
+        f"{build_cart_text(order)}\n\n"
+
+        "⬅️ برای تعیین قیمت، روی <b>همین پیام Reply</b> کنید "
+        "و مبلغ را بفرستید.\n\n"
+
+        "مثال:\n"
+        "<code>850000</code>"
+    )
+
+    admin_message = await context_bot_send_message(
+        ADMIN_ID,
+        text,
+        parse_mode="HTML"
+    )
+
+    admin_message_id = admin_message.message_id
+
+    order.admin_price_message_id = admin_message_id
+    order.waiting_for_admin_price = True
+    order.state = WAITING_ADMIN_PRICE
+
+    admin_price_requests[admin_message_id] = {
+        "user_id": user_id,
+        "order_id": order.order_id,
+    }
+
+
+# =========================================================
+# DELIVER ADMIN PRICE
+# =========================================================
+
+async def deliver_admin_price(
+    user_id: int,
+    order: OrderData,
+    price: str,
+    admin_message_id: Optional[int] = None
+):
+
+    try:
+
+        await context_bot_send_message(
+            user_id,
+            (
+                "💰 <b>قیمت سفارش شما مشخص شد.</b>\n\n"
+                f"🔖 شماره سفارش: "
+                f"<code>{escape(order.order_id)}</code>\n\n"
+                f"💵 مبلغ قابل پرداخت: "
+                f"<b>{escape(price)} تومان</b>\n\n"
+                "پس از پرداخت، رسید را ارسال کنید."
+            ),
+            parse_mode="HTML",
+            reply_markup=receipt_keyboard()
+        )
+
+    except TelegramError as exc:
+
+        logger.exception(
+            "Could not send admin price to customer %s",
+            user_id
+        )
+
+        try:
+            await context_bot_send_message(
+                ADMIN_ID,
+                (
+                    "❌ ارسال قیمت به مشتری انجام نشد.\n\n"
+                    f"شماره سفارش: "
+                    f"<code>{escape(order.order_id)}</code>\n"
+                    f"خطا: <code>{escape(str(exc))}</code>"
+                ),
+                parse_mode="HTML"
+            )
+        except Exception:
+            logger.exception(
+                "Could not notify admin about failed price delivery."
+            )
+
+        return False
+
+    order.price = price
+    order.price_known = True
+    order.waiting_for_admin_price = False
+    order.state = RECEIPT
+
+    cleanup_price_request(admin_message_id)
+
+    if admin_message_id != order.admin_price_message_id:
+        cleanup_price_request(order.admin_price_message_id)
+
+    order.admin_price_message_id = None
+
+    try:
+        await context_bot_send_message(
+            ADMIN_ID,
+            (
+                "✅ قیمت با موفقیت برای مشتری ارسال شد.\n\n"
+                f"🔖 شماره سفارش: "
+                f"<code>{escape(order.order_id)}</code>\n"
+                f"💰 مبلغ: <b>{escape(price)} تومان</b>"
+            ),
+            parse_mode="HTML"
+        )
+    except Exception:
+        logger.exception(
+            "Could not notify admin about successful price delivery."
+        )
+
+    return True
+
+
+# =========================================================
+# SEND FINAL ORDER TO ADMIN
+# =========================================================
+
+async def send_final_order_to_admin(
+    user_id: int,
+    order: OrderData
+):
+
+    try:
+
+        summary = build_admin_order_summary(
+            user_id,
+            order
+        )
+
+        await context_bot_send_message(
+            ADMIN_ID,
+            summary,
+            parse_mode="HTML"
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Could not send admin order summary."
+        )
+
+        try:
+            await context_bot_send_message(
+                ADMIN_ID,
+                (
+                    "❌ خطا در ارسال خلاصه سفارش\n\n"
+                    f"شماره سفارش: "
+                    f"<code>{escape(order.order_id)}</code>\n"
+                    f"خطا: <code>{escape(str(exc))}</code>"
+                ),
+                parse_mode="HTML"
+            )
+        except Exception:
+            logger.exception(
+                "Could not send summary error to admin."
+            )
+
+        return False
+
+    # -----------------------------------------------------
+    # SEND PRODUCT MEDIA
+    # -----------------------------------------------------
+
+    for index, item in enumerate(order.cart, start=1):
+
+        try:
+
+            caption = (
+                f"🛍 <b>محصول {index}</b>\n"
+                f"🔖 سفارش: "
+                f"<code>{escape(order.order_id)}</code>"
+            )
+
+            if item.details:
+                caption += (
+                    f"\n📝 توضیحات: "
+                    f"{escape(item.details)}"
+                )
+
+            if item.product_type == "photo":
+
+                await application.bot.send_photo(
+                    chat_id=ADMIN_ID,
+                    photo=item.product_file_id,
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+
+            elif item.product_type == "document":
+
+                await application.bot.send_document(
+                    chat_id=ADMIN_ID,
+                    document=item.product_file_id,
+                    caption=caption,
+                    parse_mode="HTML"
+                )
+
+        except Exception:
+
+            logger.exception(
+                "Could not send product media %s",
+                index
+            )
+
+    # -----------------------------------------------------
+    # SEND RECEIPT
+    # -----------------------------------------------------
+
+    if order.receipt_file_id:
+
+        try:
+
+            receipt_caption = (
+                "💳 <b>رسید پرداخت سفارش</b>\n\n"
+                f"🔖 شماره سفارش: "
+                f"<code>{escape(order.order_id)}</code>\n"
+                f"👤 مشتری: "
+                f"{escape(order.first_name)} "
+                f"{escape(order.last_name)}\n"
+                f"🆔 Telegram ID: "
+                f"<code>{user_id}</code>"
+            )
+
+            if order.receipt_type == "photo":
+
+                await application.bot.send_photo(
+                    chat_id=ADMIN_ID,
+                    photo=order.receipt_file_id,
+                    caption=receipt_caption,
+                    parse_mode="HTML"
+                )
+
+            elif order.receipt_type == "document":
+
+                await application.bot.send_document(
+                    chat_id=ADMIN_ID,
+                    document=order.receipt_file_id,
+                    caption=receipt_caption,
+                    parse_mode="HTML"
+                )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Could not send payment receipt."
+            )
+
+            try:
+                await context_bot_send_message(
+                    ADMIN_ID,
+                    (
+                        "❌ ارسال رسید پرداخت انجام نشد.\n\n"
+                        f"شماره سفارش: "
+                        f"<code>{escape(order.order_id)}</code>\n"
+                        f"خطا: <code>{escape(str(exc))}</code>"
+                    ),
+                    parse_mode="HTML"
+                )
+            except Exception:
+                logger.exception(
+                    "Could not notify admin about receipt failure."
+                )
+
+            return False
+
+    # -----------------------------------------------------
+    # FINAL ADMIN MESSAGE
+    # -----------------------------------------------------
+
+    try:
+
+        await context_bot_send_message(
+            ADMIN_ID,
+            (
+                "✅ <b>سفارش کامل دریافت شد.</b>\n\n"
+                f"🔖 شماره سفارش: "
+                f"<code>{escape(order.order_id)}</code>\n"
+                "📦 اطلاعات سفارش، محصولات و رسید ارسال شدند."
+            ),
+            parse_mode="HTML"
+        )
+
+    except Exception:
+        logger.exception(
+            "Could not send final admin notification."
+        )
+
+    return True
+
+
+# =========================================================
+# CALLBACK HANDLER
 # =========================================================
 
 async def callback_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     query = update.callback_query
 
     if not query:
@@ -799,9 +1177,9 @@ async def callback_handler(
     await query.answer()
 
     user_id = query.from_user.id
-    data = query.data or ""
-
     order = get_order(user_id)
+
+    data = query.data or ""
 
     # -----------------------------------------------------
     # CANCEL
@@ -811,15 +1189,16 @@ async def callback_handler(
 
         reset_order(user_id)
 
-        await query.message.edit_reply_markup(
-            reply_markup=None
+        await query.edit_message_text(
+            "❌ سفارش لغو شد.\n\n"
+            "هر زمان خواستید می‌توانید دوباره خرید را شروع کنید."
         )
 
-        await query.message.reply_text(
-            "❌ سفارش لغو شد.\n\n"
-            "هر زمان خواستید می‌توانید دوباره خرید را شروع کنید.",
-            reply_markup=main_keyboard(),
-        )
+        if query.message:
+            await query.message.reply_text(
+                "🛍 برای شروع دوباره:",
+                reply_markup=main_keyboard()
+            )
 
         return
 
@@ -832,16 +1211,14 @@ async def callback_handler(
         reset_order(user_id)
 
         order = get_order(user_id)
+
         order.state = NAME
 
-        await query.message.edit_reply_markup(
-            reply_markup=None
+        await query.edit_message_text(
+            "🛍 خرید جدید شروع شد."
         )
 
-        await query.message.reply_text(
-            "👤 لطفاً نام خود را وارد کنید:",
-            reply_markup=cancel_keyboard(),
-        )
+        await ask_first_name(update)
 
         return
 
@@ -853,10 +1230,11 @@ async def callback_handler(
 
         order.state = PRODUCT
 
-        await query.message.reply_text(
-            "🛍 محصول بعدی را ارسال کنید.",
-            reply_markup=product_keyboard(),
+        await query.edit_message_text(
+            "➕ افزودن محصول جدید"
         )
+
+        await ask_product(update)
 
         return
 
@@ -867,17 +1245,20 @@ async def callback_handler(
     if data == "continue_order":
 
         if not order.cart:
-            await query.message.reply_text(
-                "⚠️ هنوز محصولی به سبد اضافه نشده است."
+
+            await query.edit_message_text(
+                "⚠️ ابتدا حداقل یک محصول اضافه کنید."
             )
+
             return
 
         order.state = ADDRESS
 
-        await query.message.reply_text(
-            "📍 لطفاً آدرس کامل خود را در یک پیام ارسال کنید.",
-            reply_markup=cancel_keyboard(),
+        await query.edit_message_text(
+            "➡️ ادامه سفارش"
         )
+
+        await ask_address(update)
 
         return
 
@@ -887,24 +1268,24 @@ async def callback_handler(
 
     if data == "skip_product_details":
 
-        if not order.cart:
-            await query.message.reply_text(
-                "⚠️ محصولی وجود ندارد."
-            )
-            return
-
-        order.cart[-1].details = ""
         order.state = CART
 
-        await query.message.reply_text(
-            "🛒 محصول به سبد خرید اضافه شد.",
-            reply_markup=cart_keyboard(),
-        )
+        if query.message:
+
+            await query.edit_message_text(
+                "✅ توضیحات این محصول ثبت نشد."
+            )
+
+            await query.message.reply_text(
+                build_cart_text(order),
+                parse_mode="HTML",
+                reply_markup=cart_keyboard()
+            )
 
         return
 
     # -----------------------------------------------------
-    # SHIPPING
+    # SHIPPING POST
     # -----------------------------------------------------
 
     if data == "shipping_post":
@@ -912,68 +1293,28 @@ async def callback_handler(
         order.shipping_method = SHIPPING_POST
         order.state = CUSTOMER_DESCRIPTION
 
-        await query.message.reply_text(
-            "📦 روش ارسال: پست\n\n"
-            "📝 اگر توضیح دیگری درباره سفارش دارید ارسال کنید.\n"
-            "اگر ندارید، گزینه «بدون توضیحات» را بزنید.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "⏭ بدون توضیحات",
-                        callback_data="skip_customer_description",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "❌ لغو سفارش",
-                        callback_data="cancel_order",
-                    )
-                ],
-            ]),
+        await query.edit_message_text(
+            "📦 روش ارسال: پست"
         )
 
+        await ask_customer_description(update)
+
         return
+
+    # -----------------------------------------------------
+    # SHIPPING PICKUP
+    # -----------------------------------------------------
 
     if data == "shipping_pickup":
 
         order.shipping_method = SHIPPING_PICKUP
         order.state = CUSTOMER_DESCRIPTION
 
-        await query.message.reply_text(
-            "🏪 روش دریافت: دریافت توسط مشتری\n\n"
-            "📝 اگر توضیح دیگری درباره سفارش دارید ارسال کنید.\n"
-            "اگر ندارید، گزینه «بدون توضیحات» را بزنید.",
-            reply_markup=InlineKeyboardMarkup([
-                [
-                    InlineKeyboardButton(
-                        "⏭ بدون توضیحات",
-                        callback_data="skip_customer_description",
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        "❌ لغو سفارش",
-                        callback_data="cancel_order",
-                    )
-                ],
-            ]),
+        await query.edit_message_text(
+            "🏪 روش دریافت: دریافت توسط مشتری"
         )
 
-        return
-
-    # -----------------------------------------------------
-    # CUSTOMER DESCRIPTION
-    # -----------------------------------------------------
-
-    if data == "skip_customer_description":
-
-        order.customer_description = ""
-        order.state = PRICE_STATUS
-
-        await query.message.reply_text(
-            "💰 وضعیت قیمت محصول را مشخص کنید:",
-            reply_markup=price_keyboard(),
-        )
+        await ask_customer_description(update)
 
         return
 
@@ -985,6 +1326,10 @@ async def callback_handler(
 
         order.price_known = True
         order.state = PAYMENT
+
+        await query.edit_message_text(
+            "💰 قیمت مشخص است."
+        )
 
         await ask_price(update)
 
@@ -998,30 +1343,60 @@ async def callback_handler(
 
         order.price_known = False
 
-        await send_price_request_to_admin(
-            user_id=user_id,
-            order=order,
+        await query.edit_message_text(
+            "⏳ درخواست قیمت برای مدیریت فروشگاه ارسال می‌شود..."
         )
+
+        try:
+
+            await send_price_request_to_admin(
+                user_id,
+                order
+            )
+
+            await context_bot_send_message(
+                user_id,
+                (
+                    "⏳ <b>درخواست قیمت ارسال شد.</b>\n\n"
+                    f"🔖 شماره سفارش: "
+                    f"<code>{escape(order.order_id)}</code>\n\n"
+                    "پس از تعیین قیمت، مبلغ برای شما ارسال می‌شود."
+                ),
+                parse_mode="HTML"
+            )
+
+        except Exception as exc:
+
+            logger.exception(
+                "Could not send price request."
+            )
+
+            order.waiting_for_admin_price = False
+            order.state = PRICE_STATUS
+
+            await context_bot_send_message(
+                user_id,
+                (
+                    "❌ ارسال درخواست قیمت با مشکل مواجه شد.\n\n"
+                    f"خطا: <code>{escape(str(exc))}</code>\n\n"
+                    "لطفاً دوباره تلاش کنید."
+                ),
+                parse_mode="HTML",
+                reply_markup=price_keyboard()
+            )
 
         return
 
     # -----------------------------------------------------
-    # SEND RECEIPT BUTTON
+    # SEND RECEIPT
     # -----------------------------------------------------
 
     if data == "send_receipt":
 
-        if not order.price:
-            await query.message.reply_text(
-                "⚠️ هنوز مبلغ سفارش مشخص نشده است."
-            )
-            return
-
         order.state = RECEIPT
 
-        await query.message.reply_text(
-            "📸 لطفاً عکس یا فایل رسید پرداخت را ارسال کنید.",
-            reply_markup=cancel_keyboard(),
+        await query.edit_message_text(
+            "📤 لطفاً رسید پرداخت را به‌صورت عکس یا فایل ارسال کنید."
         )
 
         return
@@ -1033,47 +1408,37 @@ async def callback_handler(
     if data == "confirm_order":
 
         if not order.receipt_file_id:
-            await query.message.reply_text(
-                "⚠️ رسید پرداخت هنوز دریافت نشده است."
+
+            await query.answer(
+                "ابتدا رسید پرداخت را ارسال کنید.",
+                show_alert=True
             )
+
             return
 
-        try:
-            success = await send_final_order_to_admin(
-                user_id=user_id,
-                order=order,
-            )
-
-        except Exception as exc:
-            logger.exception(
-                "Error while sending final order: %s",
-                exc,
-            )
-
-            success = False
+        success = await send_final_order_to_admin(
+            user_id,
+            order
+        )
 
         if not success:
 
-            await query.message.reply_text(
-                "⚠️ هنگام ارسال سفارش به ادمین مشکلی ایجاد شد.\n"
-                "اطلاعات سفارش پاک نشده است.\n\n"
-                "لطفاً دوباره روی تأیید نهایی بزنید."
+            await query.answer(
+                "ارسال سفارش به مدیریت با مشکل مواجه شد.",
+                show_alert=True
             )
 
             return
 
         order.state = START
 
-        await query.message.edit_reply_markup(
-            reply_markup=None
-        )
-
-        await query.message.reply_text(
-            "✅ سفارش شما با موفقیت ثبت شد.\n\n"
-            f"🔖 شماره سفارش: <code>{order.order_id}</code>\n\n"
-            "ممنون از خرید شما 🌷",
-            reply_markup=main_keyboard(),
-            parse_mode="HTML",
+        await query.edit_message_text(
+            "✅ <b>سفارش شما با موفقیت ثبت شد.</b>\n\n"
+            f"🔖 شماره سفارش: "
+            f"<code>{escape(order.order_id)}</code>\n\n"
+            "سفارش برای مدیریت فروشگاه ارسال شد.\n"
+            "از خرید شما متشکریم ❤️",
+            parse_mode="HTML"
         )
 
         return
@@ -1087,19 +1452,213 @@ async def callback_handler(
         reset_order(user_id)
 
         order = get_order(user_id)
+
         order.state = NAME
 
-        await query.message.edit_reply_markup(
-            reply_markup=None
+        await query.edit_message_text(
+            "✏️ ویرایش سفارش شروع شد."
         )
 
-        await query.message.reply_text(
-            "✏️ اطلاعات قبلی حذف شد.\n\n"
-            "👤 لطفاً نام خود را دوباره وارد کنید:",
-            reply_markup=cancel_keyboard(),
+        await ask_first_name(update)
+
+        return
+
+
+# =========================================================
+# ADMIN MESSAGE HANDLER
+# =========================================================
+
+async def handle_admin_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE
+):
+
+    if not update.message:
+        return
+
+    # فقط مدیر
+    if not update.effective_user:
+        return
+
+    if update.effective_user.id != ADMIN_ID:
+        return
+
+    text = normalize_text(update.message.text or "")
+
+    # -----------------------------------------------------
+    # LEGACY:
+    # /price USER_ID PRICE
+    # -----------------------------------------------------
+
+    if text.lower().startswith("/price"):
+
+        parts = text.split()
+
+        if len(parts) != 3:
+
+            await update.message.reply_text(
+                "فرمت صحیح:\n\n"
+                "/price USER_ID PRICE\n\n"
+                "مثال:\n"
+                "/price 123456789 850000"
+            )
+
+            return
+
+        try:
+            customer_id = int(parts[1])
+        except ValueError:
+
+            await update.message.reply_text(
+                "❌ USER_ID باید عدد باشد."
+            )
+
+            return
+
+        price = normalize_price(parts[2])
+
+        if price is None:
+
+            await update.message.reply_text(
+                "❌ مبلغ نامعتبر است."
+            )
+
+            return
+
+        order = orders.get(customer_id)
+
+        if not order:
+
+            await update.message.reply_text(
+                "❌ سفارشی برای این کاربر پیدا نشد."
+            )
+
+            return
+
+        if not order.waiting_for_admin_price:
+
+            await update.message.reply_text(
+                "⚠️ این سفارش در انتظار قیمت نیست."
+            )
+
+            return
+
+        await deliver_admin_price(
+            customer_id,
+            order,
+            price,
+            order.admin_price_message_id
         )
 
         return
+
+    # -----------------------------------------------------
+    # REPLY TO PRICE REQUEST
+    # -----------------------------------------------------
+
+    replied_message = update.message.reply_to_message
+
+    if replied_message:
+
+        replied_message_id = replied_message.message_id
+
+        request_data = admin_price_requests.get(
+            replied_message_id
+        )
+
+        user_id = None
+        order = None
+
+        # مسیر اصلی: ID پیام ذخیره شده
+        if request_data:
+
+            user_id = request_data.get("user_id")
+
+            order_id = request_data.get("order_id")
+
+            if user_id is not None:
+                candidate_order = orders.get(user_id)
+
+                if (
+                    candidate_order
+                    and candidate_order.order_id == order_id
+                ):
+                    order = candidate_order
+
+        # مسیر پشتیبان: استخراج Order ID از متن
+        if order is None:
+
+            replied_text = (
+                replied_message.text
+                or replied_message.caption
+                or ""
+            )
+
+            order_id = extract_order_id(
+                replied_text
+            )
+
+            if order_id:
+
+                user_id, order = find_order_by_order_id(
+                    order_id
+                )
+
+        if order is None or user_id is None:
+
+            await update.message.reply_text(
+                "❌ نتوانستم سفارش مربوط به این Reply را پیدا کنم.\n\n"
+                "مطمئن شوید که مستقیماً روی پیام «درخواست قیمت» Reply کرده‌اید."
+            )
+
+            return
+
+        if not order.waiting_for_admin_price:
+
+            await update.message.reply_text(
+                "⚠️ این سفارش دیگر در انتظار قیمت نیست."
+            )
+
+            return
+
+        price = normalize_price(text)
+
+        if price is None:
+
+            await update.message.reply_text(
+                "❌ مبلغ معتبر نیست.\n\n"
+                "فقط مبلغ را ارسال کنید.\n"
+                "مثال:\n"
+                "850000"
+            )
+
+            return
+
+        success = await deliver_admin_price(
+            user_id,
+            order,
+            price,
+            replied_message_id
+        )
+
+        if not success:
+
+            await update.message.reply_text(
+                "❌ ارسال قیمت به مشتری انجام نشد."
+            )
+
+        return
+
+    # -----------------------------------------------------
+    # NORMAL ADMIN MESSAGE
+    # -----------------------------------------------------
+
+    await update.message.reply_text(
+        "برای تعیین قیمت سفارش، روی پیام «درخواست قیمت» Reply کنید "
+        "و فقط مبلغ را ارسال کنید.\n\n"
+        "مثال:\n"
+        "850000"
+    )
 
 
 # =========================================================
@@ -1110,6 +1669,7 @@ async def customer_message_handler(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE
 ):
+
     if not update.message:
         return
 
@@ -1119,234 +1679,244 @@ async def customer_message_handler(
         return
 
     # -----------------------------------------------------
-    # ADMIN ROUTING
+    # ADMIN
     # -----------------------------------------------------
 
     if user_id == ADMIN_ID:
+
         await handle_admin_message(
             update,
-            context,
+            context
         )
+
         return
+
+    # -----------------------------------------------------
+    # ORDER
+    # -----------------------------------------------------
 
     order = get_order(user_id)
 
-    message = update.message
-    text = normalize_text(message.text or "")
+    state = order.state
 
-    # =====================================================
+    text = get_message_text(update)
+
+    # -----------------------------------------------------
+    # START
+    # -----------------------------------------------------
+
+    if state == START:
+
+        if text == "🛍 شروع خرید":
+
+            reset_order(user_id)
+
+            order = get_order(user_id)
+
+            order.state = NAME
+
+            await ask_first_name(update)
+
+            return
+
+        await update.message.reply_text(
+            "برای شروع خرید روی دکمه زیر بزنید.",
+            reply_markup=main_keyboard()
+        )
+
+        return
+
+    # -----------------------------------------------------
     # NAME
-    # =====================================================
+    # -----------------------------------------------------
 
-    if order.state == NAME:
+    if state == NAME:
 
         if not text:
-            await message.reply_text(
-                "⚠️ لطفاً نام خود را به صورت متنی وارد کنید."
+
+            await update.message.reply_text(
+                "❌ لطفاً نام خود را وارد کنید."
             )
+
             return
 
         order.first_name = text
-        order.state = PHONE
+        order.state = LAST_NAME
 
         await ask_last_name(update)
 
         return
 
-    # =====================================================
-    # PHONE
-    # =====================================================
+    # -----------------------------------------------------
+    # LAST NAME
+    # -----------------------------------------------------
 
-    if order.state == PHONE:
+    if state == LAST_NAME:
 
-        # Contact
-        if message.contact:
+        if not text:
 
-            contact = message.contact
-
-            if contact.user_id and contact.user_id != user_id:
-                await message.reply_text(
-                    "⚠️ لطفاً شماره خودتان را ارسال کنید."
-                )
-                return
-
-            order.phone = normalize_digits(
-                contact.phone_number
+            await update.message.reply_text(
+                "❌ لطفاً نام خانوادگی خود را وارد کنید."
             )
 
-        else:
+            return
 
-            phone = normalize_digits(text)
+        order.last_name = text
+        order.state = PHONE
 
-            phone = phone.replace(
-                " ",
-                ""
-            ).replace(
-                "-",
-                ""
-            )
-
-            if not re.fullmatch(
-                r"^\+?\d{10,15}$",
-                phone
-            ):
-                await message.reply_text(
-                    "⚠️ شماره موبایل معتبر نیست.\n"
-                    "مثلاً 09121234567"
-                )
-                return
-
-            order.phone = phone
-
-        order.state = PRODUCT
-
-        await message.reply_text(
-            "✅ شماره ثبت شد.\n\n"
-            "🛍 حالا محصول موردنظر را ارسال کنید.\n\n"
-            "می‌توانید:\n"
-            "• عکس محصول\n"
-            "• فایل محصول\n"
-            "• کد یا نام محصول",
-            reply_markup=product_keyboard(),
-        )
+        await ask_phone(update)
 
         return
 
-    # =====================================================
+    # -----------------------------------------------------
+    # PHONE
+    # -----------------------------------------------------
+
+    if state == PHONE:
+
+        phone = ""
+
+        if update.message.contact:
+
+            phone = normalize_digits(
+                update.message.contact.phone_number
+            ).strip()
+
+        elif text:
+
+            phone = normalize_digits(
+                text
+            ).strip()
+
+        # حذف فاصله و خط تیره
+        phone = re.sub(
+            r"[\s-]",
+            "",
+            phone
+        )
+
+        if not re.fullmatch(
+            r"\+?\d{10,15}",
+            phone
+        ):
+
+            await update.message.reply_text(
+                "❌ شماره تلفن معتبر نیست.\n\n"
+                "مثال:\n"
+                "+989121234567\n\n"
+                "یا از دکمه ارسال شماره استفاده کنید."
+            )
+
+            return
+
+        order.phone = phone
+
+        await update.message.reply_text(
+            "✅ شماره تماس ثبت شد.",
+            reply_markup=ReplyKeyboardRemove()
+        )
+
+        order.state = PRODUCT
+
+        await ask_product(update)
+
+        return
+
+    # -----------------------------------------------------
     # PRODUCT
-    # =====================================================
+    # -----------------------------------------------------
 
-    if order.state == PRODUCT:
+    if state == PRODUCT:
 
-        photo_file_id = get_photo_file_id(message)
-        document_file_id = get_document_file_id(message)
+        photo_file_id = get_photo_file_id(update)
+
+        document_file_id = get_document_file_id(update)
 
         if photo_file_id:
 
             item = CartItem(
                 product_type="photo",
-                product_file_id=photo_file_id,
+                product_file_id=photo_file_id
             )
 
-            order.cart.append(item)
-
-            order.state = PRODUCT_DETAILS
-
-            await message.reply_text(
-                "📷 عکس محصول دریافت شد.\n\n"
-                "📝 اگر جزئیاتی مثل سایز، رنگ یا تعداد دارید ارسال کنید.",
-                reply_markup=product_details_keyboard(),
-            )
-
-            return
-
-        if document_file_id:
+        elif document_file_id:
 
             item = CartItem(
                 product_type="document",
-                product_file_id=document_file_id,
+                product_file_id=document_file_id
             )
 
-            order.cart.append(item)
-
-            order.state = PRODUCT_DETAILS
-
-            await message.reply_text(
-                "📄 فایل محصول دریافت شد.\n\n"
-                "📝 اگر جزئیاتی مثل سایز، رنگ یا تعداد دارید ارسال کنید.",
-                reply_markup=product_details_keyboard(),
-            )
-
-            return
-
-        if text:
+        elif text:
 
             item = CartItem(
                 product_type="text",
-                product_text=text,
+                product_text=text
             )
 
-            order.cart.append(item)
+        else:
 
-            order.state = PRODUCT_DETAILS
-
-            await message.reply_text(
-                "✅ محصول دریافت شد.\n\n"
-                "📝 اگر جزئیاتی مثل سایز، رنگ یا تعداد دارید ارسال کنید.",
-                reply_markup=product_details_keyboard(),
+            await update.message.reply_text(
+                "❌ لطفاً عکس، فایل یا کد/نام محصول را ارسال کنید."
             )
 
             return
 
-        await message.reply_text(
-            "⚠️ لطفاً عکس، فایل یا کد/نام محصول را ارسال کنید."
+        order.cart.append(item)
+
+        order.state = PRODUCT_DETAILS
+
+        await update.message.reply_text(
+            "✅ محصول اضافه شد."
         )
+
+        await ask_product_details(update)
 
         return
 
-    # =====================================================
+    # -----------------------------------------------------
     # PRODUCT DETAILS
-    # =====================================================
+    # -----------------------------------------------------
 
-    if order.state == PRODUCT_DETAILS:
+    if state == PRODUCT_DETAILS:
 
-        if not order.cart:
-            order.state = PRODUCT
+        if text:
 
-            await ask_product(update)
+            order.cart[-1].details = text
 
-            return
-
-        if not text:
-
-            await message.reply_text(
-                "⚠️ لطفاً توضیحات را به صورت متنی ارسال کنید."
-            )
-
-            return
-
-        order.cart[-1].details = text
         order.state = CART
 
-        await message.reply_text(
-            "✅ جزئیات محصول ثبت شد.",
-            reply_markup=cart_keyboard(),
+        await update.message.reply_text(
+            "✅ اطلاعات محصول ثبت شد.\n\n"
+            + build_cart_text(order),
+            parse_mode="HTML",
+            reply_markup=cart_keyboard()
         )
 
         return
 
-    # =====================================================
+    # -----------------------------------------------------
     # CART
-    # =====================================================
+    # -----------------------------------------------------
 
-    if order.state == CART:
+    if state == CART:
 
-        await message.reply_text(
-            "از دکمه‌های زیر استفاده کنید:",
-            reply_markup=cart_keyboard(),
+        await update.message.reply_text(
+            "لطفاً یکی از گزینه‌های زیر را انتخاب کنید.",
+            reply_markup=cart_keyboard()
         )
 
         return
 
-    # =====================================================
+    # -----------------------------------------------------
     # ADDRESS
-    # =====================================================
+    # -----------------------------------------------------
 
-    if order.state == ADDRESS:
-
-        if not text:
-
-            await message.reply_text(
-                "⚠️ لطفاً آدرس را به صورت متنی ارسال کنید."
-            )
-
-            return
+    if state == ADDRESS:
 
         if len(text) < 10:
 
-            await message.reply_text(
-                "⚠️ آدرس واردشده خیلی کوتاه است.\n"
-                "لطفاً آدرس کامل را ارسال کنید."
+            await update.message.reply_text(
+                "❌ لطفاً آدرس کامل‌تری وارد کنید."
             )
 
             return
@@ -1358,32 +1928,56 @@ async def customer_message_handler(
 
         return
 
-    # =====================================================
+    # -----------------------------------------------------
     # CUSTOMER DESCRIPTION
-    # =====================================================
+    # -----------------------------------------------------
 
-    if order.state == CUSTOMER_DESCRIPTION:
+    if state == CUSTOMER_DESCRIPTION:
 
-        order.customer_description = text
+        if text.lower() in [
+            "ندارم",
+            "ندارد",
+            "خیر",
+            "نه"
+        ]:
+
+            order.customer_description = ""
+
+        else:
+
+            order.customer_description = text
+
         order.state = PRICE_STATUS
 
         await ask_price_status(update)
 
         return
 
-    # =====================================================
-    # PRICE
-    # =====================================================
+    # -----------------------------------------------------
+    # PRICE STATUS
+    # -----------------------------------------------------
 
-    if order.state == PAYMENT:
+    if state == PRICE_STATUS:
+
+        await update.message.reply_text(
+            "لطفاً یکی از گزینه‌های مربوط به قیمت را انتخاب کنید.",
+            reply_markup=price_keyboard()
+        )
+
+        return
+
+    # -----------------------------------------------------
+    # PAYMENT / ENTER PRICE
+    # -----------------------------------------------------
+
+    if state == PAYMENT:
 
         price = normalize_price(text)
 
         if price is None:
 
-            await message.reply_text(
-                "⚠️ مبلغ نامعتبر است.\n\n"
-                "لطفاً فقط عدد وارد کنید.\n"
+            await update.message.reply_text(
+                "❌ مبلغ نامعتبر است.\n\n"
                 "مثال:\n"
                 "850000"
             )
@@ -1391,20 +1985,40 @@ async def customer_message_handler(
             return
 
         order.price = price
+        order.price_known = True
         order.state = RECEIPT
+
+        await update.message.reply_text(
+            f"✅ مبلغ {escape(price)} تومان ثبت شد.",
+            parse_mode="HTML"
+        )
 
         await ask_receipt(update)
 
         return
 
-    # =====================================================
+    # -----------------------------------------------------
+    # WAITING ADMIN PRICE
+    # -----------------------------------------------------
+
+    if state == WAITING_ADMIN_PRICE:
+
+        await update.message.reply_text(
+            "⏳ هنوز قیمت سفارش توسط مدیریت مشخص نشده است.\n\n"
+            "لطفاً منتظر بمانید."
+        )
+
+        return
+
+    # -----------------------------------------------------
     # RECEIPT
-    # =====================================================
+    # -----------------------------------------------------
 
-    if order.state == RECEIPT:
+    if state == RECEIPT:
 
-        photo_file_id = get_photo_file_id(message)
-        document_file_id = get_document_file_id(message)
+        photo_file_id = get_photo_file_id(update)
+
+        document_file_id = get_document_file_id(update)
 
         if photo_file_id:
 
@@ -1418,591 +2032,35 @@ async def customer_message_handler(
 
         else:
 
-            await message.reply_text(
-                "⚠️ رسید دریافت نشد.\n\n"
-                "لطفاً عکس یا فایل رسید پرداخت را ارسال کنید."
+            await update.message.reply_text(
+                "❌ لطفاً رسید را به‌صورت عکس یا فایل ارسال کنید."
             )
 
             return
-
-        # -------------------------------------------------
-        # VERY IMPORTANT:
-        # Send complete order information ONCE
-        # BEFORE confirmation.
-        # -------------------------------------------------
 
         order.state = CONFIRM
 
-        summary = build_customer_order_summary(
-            order
-        )
-
-        await message.reply_text(
-            summary,
-            reply_markup=confirm_keyboard(),
+        await update.message.reply_text(
+            "✅ رسید پرداخت دریافت شد.\n\n"
+            + build_customer_order_summary(order),
             parse_mode="HTML",
+            reply_markup=confirm_keyboard()
         )
 
         return
 
-    # =====================================================
-    # WAITING ADMIN PRICE
-    # =====================================================
-
-    if order.state == WAITING_ADMIN_PRICE:
-
-        await message.reply_text(
-            "⏳ درخواست قیمت شما برای ادمین ارسال شده است.\n"
-            "لطفاً تا دریافت قیمت صبر کنید."
-        )
-
-        return
-
-    # =====================================================
+    # -----------------------------------------------------
     # CONFIRM
-    # =====================================================
+    # -----------------------------------------------------
 
-    if order.state == CONFIRM:
+    if state == CONFIRM:
 
-        await message.reply_text(
-            "🔎 لطفاً از دکمه زیر برای تأیید نهایی استفاده کنید.",
-            reply_markup=confirm_keyboard(),
+        await update.message.reply_text(
+            "لطفاً از دکمه‌های زیر برای تأیید یا ویرایش سفارش استفاده کنید.",
+            reply_markup=confirm_keyboard()
         )
 
         return
-
-    # =====================================================
-    # START / DEFAULT
-    # =====================================================
-
-    if order.state == START:
-
-        await message.reply_text(
-            "برای شروع خرید روی دکمه زیر بزنید.",
-            reply_markup=main_keyboard(),
-        )
-
-        return
-
-
-# =========================================================
-# ADMIN PRICE REQUEST
-# =========================================================
-
-async def send_price_request_to_admin(
-    user_id: int,
-    order: OrderData,
-):
-    text = (
-        "💰 <b>درخواست قیمت جدید</b>\n"
-        "\n"
-        f"🔖 <b>شماره سفارش:</b> "
-        f"<code>{order.order_id}</code>\n"
-        f"👤 <b>مشتری:</b> "
-        f"{order.first_name} {order.last_name}\n"
-        f"📱 <b>شماره:</b> {order.phone}\n"
-        f"🆔 <b>Telegram ID:</b> "
-        f"<code>{user_id}</code>\n"
-        "\n"
-        f"{build_cart_text(order)}\n"
-        "\n"
-        "⬅️ برای تعیین قیمت، روی همین پیام Reply کنید "
-        "و مبلغ را بفرستید.\n\n"
-        "مثال:\n"
-        "<code>850000</code>"
-    )
-
-    try:
-
-        admin_message = await context_bot_send_message(
-            ADMIN_ID,
-            text,
-        )
-
-    except Exception as exc:
-
-        logger.exception(
-            "Could not send price request to admin: %s",
-            exc,
-        )
-
-        # پیام خطا به مشتری از طریق Application در تابع پایین
-        # ارسال خواهد شد.
-        raise
-
-    admin_message_id = admin_message.message_id
-
-    order.admin_price_message_id = admin_message_id
-    order.waiting_for_admin_price = True
-    order.state = WAITING_ADMIN_PRICE
-
-    admin_price_requests[admin_message_id] = {
-        "user_id": user_id,
-        "order_id": order.order_id,
-    }
-
-    return admin_message
-
-
-# =========================================================
-# GLOBAL BOT REFERENCE
-# =========================================================
-
-application: Optional[Application] = None
-
-
-async def context_bot_send_message(
-    chat_id: int,
-    text: str,
-    **kwargs,
-):
-    if application is None:
-        raise RuntimeError(
-            "Application هنوز ساخته نشده است."
-        )
-
-    return await application.bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        **kwargs,
-    )
-
-
-# =========================================================
-# ADMIN HANDLER
-# =========================================================
-
-async def handle_admin_message(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE,
-):
-    message = update.message
-
-    if not message:
-        return
-
-    text = normalize_text(
-        message.text or ""
-    )
-
-    # -----------------------------------------------------
-    # LEGACY COMMAND
-    #
-    # /price USER_ID PRICE
-    # -----------------------------------------------------
-
-    if text.startswith("/price"):
-
-        parts = text.split()
-
-        if len(parts) != 3:
-
-            await message.reply_text(
-                "فرمت صحیح:\n"
-                "/price USER_ID PRICE\n\n"
-                "مثال:\n"
-                "/price 123456789 850000"
-            )
-
-            return
-
-        try:
-            customer_id = int(parts[1])
-        except ValueError:
-
-            await message.reply_text(
-                "❌ USER_ID نامعتبر است."
-            )
-
-            return
-
-        price = normalize_price(parts[2])
-
-        if price is None:
-
-            await message.reply_text(
-                "❌ مبلغ نامعتبر است."
-            )
-
-            return
-
-        order = orders.get(customer_id)
-
-        if not order:
-
-            await message.reply_text(
-                "❌ سفارشی برای این مشتری پیدا نشد."
-            )
-
-            return
-
-        if not order.waiting_for_admin_price:
-
-            await message.reply_text(
-                "⚠️ این سفارش در انتظار قیمت نیست."
-            )
-
-            return
-
-        await deliver_admin_price(
-            admin_message=message,
-            customer_id=customer_id,
-            order=order,
-            price=price,
-        )
-
-        return
-
-    # -----------------------------------------------------
-    # REPLY BASED PRICE
-    # -----------------------------------------------------
-
-    replied_message_id = get_replied_message_id(
-        message
-    )
-
-    request = None
-
-    if replied_message_id is not None:
-        request = admin_price_requests.get(
-            replied_message_id
-        )
-
-    customer_id = None
-    order = None
-
-    # -----------------------------------------------------
-    # METHOD 1:
-    # Message ID mapping
-    # -----------------------------------------------------
-
-    if request:
-
-        customer_id = request["user_id"]
-
-        order_id = request["order_id"]
-
-        order = orders.get(customer_id)
-
-        if order and order.order_id != order_id:
-
-            customer_id = None
-            order = None
-
-    # -----------------------------------------------------
-    # METHOD 2:
-    # Parse order ID from replied message
-    # -----------------------------------------------------
-
-    if order is None:
-
-        replied_message = get_replied_message(
-            message
-        )
-
-        replied_text = get_message_text(
-            replied_message
-        )
-
-        order_id = extract_order_id(
-            replied_text
-        )
-
-        if order_id:
-
-            customer_id, order = find_order_by_order_id(
-                order_id
-            )
-
-    # -----------------------------------------------------
-    # No order found
-    # -----------------------------------------------------
-
-    if order is None or customer_id is None:
-
-        # فقط پیام‌هایی که احتمالاً قیمت هستند را هندل کنیم
-        if text and normalize_price(text):
-
-            await message.reply_text(
-                "⚠️ این پیام به درخواست قیمت هیچ سفارشی "
-                "متصل نیست.\n\n"
-                "لطفاً قیمت را با Reply روی پیام "
-                "«درخواست قیمت جدید» ارسال کنید."
-            )
-
-        return
-
-    # -----------------------------------------------------
-    # Order exists
-    # -----------------------------------------------------
-
-    if not order.waiting_for_admin_price:
-
-        await message.reply_text(
-            "⚠️ این سفارش دیگر در انتظار قیمت نیست."
-        )
-
-        return
-
-    price = normalize_price(text)
-
-    if price is None:
-
-        await message.reply_text(
-            "❌ مبلغ نامعتبر است.\n\n"
-            "لطفاً فقط عدد وارد کنید.\n"
-            "مثال:\n"
-            "850000"
-        )
-
-        return
-
-    await deliver_admin_price(
-        admin_message=message,
-        customer_id=customer_id,
-        order=order,
-        price=price,
-    )
-
-
-# =========================================================
-# DELIVER ADMIN PRICE TO CUSTOMER
-# =========================================================
-
-async def deliver_admin_price(
-    admin_message,
-    customer_id: int,
-    order: OrderData,
-    price: str,
-):
-
-    try:
-
-        await application.bot.send_message(
-            chat_id=customer_id,
-            text=(
-                "💰 <b>قیمت سفارش شما مشخص شد.</b>\n\n"
-                f"🔖 شماره سفارش: "
-                f"<code>{order.order_id}</code>\n"
-                f"💵 مبلغ: <b>{price} تومان</b>\n\n"
-                "لطفاً مبلغ را پرداخت کنید و سپس "
-                "رسید پرداخت را ارسال کنید."
-            ),
-            reply_markup=receipt_keyboard(),
-            parse_mode="HTML",
-        )
-
-    except TelegramError as exc:
-
-        logger.exception(
-            "Could not send price to customer: %s",
-            exc,
-        )
-
-        await admin_message.reply_text(
-            "❌ ارسال قیمت برای مشتری انجام نشد.\n"
-            "سفارش همچنان در وضعیت انتظار قیمت باقی ماند."
-        )
-
-        return False
-
-    # فقط بعد از ارسال موفق به مشتری
-    # وضعیت سفارش را تغییر می‌دهیم.
-
-    order.price = price
-    order.waiting_for_admin_price = False
-    order.state = RECEIPT
-
-    cleanup_price_request(order)
-
-    await admin_message.reply_text(
-        "✅ قیمت با موفقیت برای مشتری ارسال شد.\n\n"
-        f"🔖 سفارش: <code>{order.order_id}</code>\n"
-        f"💰 مبلغ: <b>{price} تومان</b>",
-        parse_mode="HTML",
-    )
-
-    return True
-
-
-# =========================================================
-# FINAL ORDER -> ADMIN
-# =========================================================
-
-async def send_final_order_to_admin(
-    user_id: int,
-    order: OrderData,
-) -> bool:
-
-    # -----------------------------------------------------
-    # 1. Send full order summary
-    # -----------------------------------------------------
-
-    admin_text = build_admin_order_summary(
-        order,
-        user_id,
-    )
-
-    try:
-
-        await application.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=admin_text,
-            parse_mode="HTML",
-        )
-
-    except TelegramError as exc:
-
-        logger.exception(
-            "Could not send order summary: %s",
-            exc,
-        )
-
-        return False
-
-    # -----------------------------------------------------
-    # 2. Send product media
-    # -----------------------------------------------------
-
-    for index, item in enumerate(
-        order.cart,
-        start=1
-    ):
-
-        if not item.product_file_id:
-            continue
-
-        try:
-
-            if item.product_type == "photo":
-
-                caption = (
-                    f"🛍 محصول شماره {index}\n"
-                    f"🔖 سفارش: {order.order_id}"
-                )
-
-                await application.bot.send_photo(
-                    chat_id=ADMIN_ID,
-                    photo=item.product_file_id,
-                    caption=caption,
-                )
-
-            elif item.product_type == "document":
-
-                caption = (
-                    f"📄 فایل محصول شماره {index}\n"
-                    f"🔖 سفارش: {order.order_id}"
-                )
-
-                await application.bot.send_document(
-                    chat_id=ADMIN_ID,
-                    document=item.product_file_id,
-                    caption=caption,
-                )
-
-        except TelegramError as exc:
-
-            logger.exception(
-                "Could not send product media: %s",
-                exc,
-            )
-
-            await application.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    "⚠️ ارسال یکی از فایل‌های محصول "
-                    "با خطا مواجه شد.\n\n"
-                    f"🔖 سفارش: {order.order_id}\n"
-                    f"❌ خطا: {exc}"
-                ),
-            )
-
-    # -----------------------------------------------------
-    # 3. Send receipt
-    # -----------------------------------------------------
-
-    if order.receipt_file_id:
-
-        try:
-
-            receipt_caption = (
-                "💳 رسید پرداخت\n"
-                f"🔖 سفارش: {order.order_id}\n"
-                f"👤 Telegram ID: {user_id}"
-            )
-
-            if order.receipt_type == "photo":
-
-                await application.bot.send_photo(
-                    chat_id=ADMIN_ID,
-                    photo=order.receipt_file_id,
-                    caption=receipt_caption,
-                )
-
-            elif order.receipt_type == "document":
-
-                await application.bot.send_document(
-                    chat_id=ADMIN_ID,
-                    document=order.receipt_file_id,
-                    caption=receipt_caption,
-                )
-
-            else:
-
-                # fallback
-                await application.bot.send_document(
-                    chat_id=ADMIN_ID,
-                    document=order.receipt_file_id,
-                    caption=receipt_caption,
-                )
-
-        except TelegramError as exc:
-
-            logger.exception(
-                "Could not send receipt: %s",
-                exc,
-            )
-
-            await application.bot.send_message(
-                chat_id=ADMIN_ID,
-                text=(
-                    "❌ <b>رسید پرداخت ارسال نشد.</b>\n\n"
-                    f"🔖 سفارش: <code>{order.order_id}</code>\n"
-                    f"❌ خطا: {exc}"
-                ),
-                parse_mode="HTML",
-            )
-
-            return False
-
-    # -----------------------------------------------------
-    # 4. Final admin notification
-    # -----------------------------------------------------
-
-    try:
-
-        await application.bot.send_message(
-            chat_id=ADMIN_ID,
-            text=(
-                "━━━━━━━━━━━━━━━━━━\n"
-                "✅ <b>سفارش کامل دریافت شد.</b>\n"
-                f"🔖 شماره سفارش: "
-                f"<code>{order.order_id}</code>\n"
-                "━━━━━━━━━━━━━━━━━━"
-            ),
-            parse_mode="HTML",
-        )
-
-    except TelegramError as exc:
-
-        logger.exception(
-            "Could not send final admin notification: %s",
-            exc,
-        )
-
-        # سفارش قبلاً ارسال شده، بنابراین موفق محسوب می‌شود.
-
-    return True
 
 
 # =========================================================
@@ -2011,13 +2069,52 @@ async def send_final_order_to_admin(
 
 async def error_handler(
     update: object,
-    context: ContextTypes.DEFAULT_TYPE,
+    context: ContextTypes.DEFAULT_TYPE
 ):
 
     logger.exception(
         "Unhandled exception:",
-        exc_info=context.error,
+        exc_info=context.error
     )
+
+
+# =========================================================
+# BUILD APPLICATION
+# =========================================================
+
+def build_application() -> Application:
+
+    app = (
+        ApplicationBuilder()
+        .token(TELEGRAM_BOT_TOKEN)
+        .build()
+    )
+
+    app.add_handler(
+        CommandHandler(
+            "start",
+            start_command
+        )
+    )
+
+    app.add_handler(
+        CallbackQueryHandler(
+            callback_handler
+        )
+    )
+
+    app.add_handler(
+        MessageHandler(
+            filters.ALL & ~filters.COMMAND,
+            customer_message_handler
+        )
+    )
+
+    app.add_error_handler(
+        error_handler
+    )
+
+    return app
 
 
 # =========================================================
@@ -2028,67 +2125,47 @@ def main():
 
     global application
 
-    application = (
-        ApplicationBuilder()
-        .token(TELEGRAM_BOT_TOKEN)
-        .build()
+    application = build_application()
+
+    webhook_url = (
+        f"{WEBHOOK_URL}/{WEBHOOK_PATH}"
     )
 
-    # -----------------------------------------------------
-    # COMMANDS
-    # -----------------------------------------------------
-
-    application.add_handler(
-        CommandHandler(
-            "start",
-            start_command,
-        )
-    )
-
-    # -----------------------------------------------------
-    # CALLBACK QUERIES
-    # -----------------------------------------------------
-
-    application.add_handler(
-        CallbackQueryHandler(
-            callback_handler
-        )
-    )
-
-    # -----------------------------------------------------
-    # CUSTOMER + ADMIN MESSAGES
-    # -----------------------------------------------------
-
-    application.add_handler(
-        MessageHandler(
-            filters.ALL & ~filters.COMMAND,
-            customer_message_handler,
-        )
-    )
-
-    # -----------------------------------------------------
-    # ERROR
-    # -----------------------------------------------------
-
-    application.add_error_handler(
-        error_handler
-    )
-
-    print(
-        "========================================"
-    )
-    print(
-        "Suryan Telegram Bot is running..."
-    )
-    print(
-        f"Admin ID: {ADMIN_ID}"
-    )
-    print(
+    logger.info(
         "========================================"
     )
 
-    application.run_polling(
-        allowed_updates=Update.ALL_TYPES
+    logger.info(
+        "Suryan Telegram Bot is starting..."
+    )
+
+    logger.info(
+        "Admin ID: %s",
+        ADMIN_ID
+    )
+
+    logger.info(
+        "Webhook URL: %s",
+        webhook_url
+    )
+
+    logger.info(
+        "Port: %s",
+        PORT
+    )
+
+    logger.info(
+        "========================================"
+    )
+
+    application.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH,
+        webhook_url=webhook_url,
+        secret_token=WEBHOOK_SECRET or None,
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
     )
 
 
