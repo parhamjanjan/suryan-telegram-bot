@@ -2035,12 +2035,12 @@ async def error_handler(
 def main():
 
     if (
-        not BOT_TOKEN
-        or BOT_TOKEN == "توکن_ربات_اینجا"
+        not TELEGRAM_BOT_TOKEN
+        or TELEGRAM_BOT_TOKEN == "توکن_ربات_اینجا"
     ):
 
         raise RuntimeError(
-            "BOT_TOKEN را در ابتدای فایل تنظیم کنید."
+            "TELEGRAM_BOT_TOKEN را در ابتدای فایل تنظیم کنید."
         )
 
     if (
@@ -2063,7 +2063,7 @@ def main():
 
     application = (
         ApplicationBuilder()
-        .token(BOT_TOKEN)
+        .token(TELEGRAM_BOT_TOKEN)
         .build()
     )
 
