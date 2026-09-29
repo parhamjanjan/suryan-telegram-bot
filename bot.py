@@ -4,7 +4,7 @@ import logging
 from dataclasses import dataclass, field
 from typing import Optional, List, Dict
 from html import escape
-
+import os
 from telegram import (
     Update,
     InlineKeyboardButton,
@@ -26,13 +26,9 @@ from telegram.error import TelegramError
 # فقط این 3 مورد را تنظیم کن
 # =========================================================
 
-BOT_TOKEN = "توکن_ربات_اینجا"
-
-CARD_NUMBER = "شماره_کارت_اینجا"
-
-ADMIN_ID = 123456789
-
-
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CARD_NUMBER = os.getenv("CARD_NUMBER")
+ADMIN_ID = int(os.getenv("ADMIN_ID"))
 # =========================================================
 # CONFIG
 # =========================================================
