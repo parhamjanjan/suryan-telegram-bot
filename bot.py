@@ -44,7 +44,7 @@ if not TELEGRAM_BOT_TOKEN:
 # =========================================================
 
 # شناسه عددی ادمین
-ADMIN_ID = 602834325
+ADMIN_ID = 6285612246
 
 SHIPPING_POST = "پست"
 SHIPPING_PICKUP = "دریافت توسط مشتری"
